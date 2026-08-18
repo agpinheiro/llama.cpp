@@ -109,6 +109,43 @@ void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_REST
     }
 }
 
+void quantize_row_q2_1_ref(const float * GGML_RESTRICT x, block_q2_1 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK2_1;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        // scale from the RMS of the block: the codebook {-10, -3, +3, +10} scaled by
+        // d = 0.1510*rms puts the reconstruction levels at the Lloyd-Max optimum
+        // (+/-0.4528, +/-1.5104 in units of the standard deviation) for Gaussian data
+        // note: fmaf is used so that the CPU and CUDA implementations compute bit-identical scales
+        float sumsq = 0.0f;
+        for (int j = 0; j < qk; j++) {
+            const float w = x[i*qk + j];
+            sumsq = fmaf(w, w, sumsq);
+        }
+        const float rms = sqrtf(sumsq / qk);
+        const float d   = 0.1510f * rms;
+        const float id  = d > 0.0f ? 1.0f / d : 0.0f;
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        // branchless encoding against the decision thresholds -6.5, 0, +6.5
+        // (6.5 is the midpoint between the levels 3 and 10); all-zero blocks encode as code 1
+        for (int j = 0; j < qk / 4; ++j) {
+            uint8_t qb = 0;
+            for (int l = 0; l < 4; ++l) {
+                const float xn = x[i*qk + 4*j + l] * id;
+                const int q = (xn > -6.5f) + (xn > 0.0f) + (xn > 6.5f);
+                qb |= (uint8_t)q << (2*l);
+            }
+            y[i].qs[j] = qb;
+        }
+    }
+}
+
 // reference implementation for deterministic creation of model files
 void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK4_0;
@@ -452,6 +489,25 @@ void dequantize_row_q2_0(const block_q2_0 * GGML_RESTRICT x, float * GGML_RESTRI
             const uint8_t q = (x[i].qs[byte_index] >> bit_offset) & 0x03;
             // 00=-1, 01=0, 10=+1, 11=+2
             y[i*qk + j] = ((int)q - 1) * d;
+        }
+    }
+}
+
+void dequantize_row_q2_1(const block_q2_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK2_1;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    static const int8_t lut[4] = { -10, -3, 3, 10 };
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        for (int j = 0; j < qk; ++j) {
+            const uint8_t q = (x[i].qs[j/4] >> ((j % 4) * 2)) & 0x03;
+            y[i*qk + j] = lut[q] * d;
         }
     }
 }
@@ -2123,6 +2179,13 @@ size_t quantize_q2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
         qrow += row_size;
     }
     return nrow * row_size;
+}
+
+size_t quantize_q2_1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    // q2_1 has a fixed codebook, so quant_weights is not used
+    (void)quant_weights;
+    quantize_row_q2_1_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_Q2_1, n_per_row);
 }
 
 size_t quantize_q4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
@@ -5536,6 +5599,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_Q2_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q2_0, data, nb);
+            } break;
+        case GGML_TYPE_Q2_1:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_q2_1, data, nb);
             } break;
         case GGML_TYPE_Q4_0:
             {

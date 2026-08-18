@@ -99,6 +99,9 @@ typedef sycl::half2 ggml_half2;
 #define QI2_0 (QK2_0 / 32)
 #define QR2_0 1
 
+#define QI2_1 (QK2_1 / 32)
+#define QR2_1 1
+
 
 #define QI4_0 (QK4_0 / (4 * QR4_0))
 #define QR4_0 2
@@ -190,6 +193,16 @@ typedef struct {
     uint8_t qs[QK2_0 / 4];   // 2 bits per element
 } block_q2_0;
 static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
+
+// 2-bit quantization with the fixed codebook {-10, -3, +3, +10} and an RMS-based scale
+// codes 0..3 map to d * {-10, -3, +3, +10}; d = 0.1510 * rms(block)
+// designed for KV cache quantization of (approximately) Gaussian data
+#define QK2_1 64
+typedef struct {
+    ggml_half d;             // scale
+    uint8_t qs[QK2_1 / 4];   // 2 bits per element
+} block_q2_1;
+static_assert(sizeof(block_q2_1) == sizeof(ggml_half) + QK2_1 / 4, "wrong q2_1 block size/padding");
 
 #define QK4_0 32
 typedef struct {

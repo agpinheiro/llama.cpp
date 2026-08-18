@@ -312,6 +312,10 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    GGML_TYPE_Q2_0, // 2.25 bpw (bloco de 64 + escala fp16); CPU apenas por enquanto,
+                    // o flash-attention em CUDA ainda nao tem kernel para ele
+    GGML_TYPE_Q2_1, // 2.25 bpw, codebook {-10,-3,+3,+10} com escala baseada no RMS do bloco;
+                    // feito para o KV cache (dados ~gaussianos apos a rotacao de Hadamard)
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {

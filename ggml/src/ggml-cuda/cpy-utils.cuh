@@ -153,6 +153,58 @@ static __device__ void quantize_f32_q8_0_block(const float * __restrict__ x, blo
     }
 }
 
+static __device__ void quantize_f32_q2_0_block(const float * __restrict__ x, block_q2_0 * __restrict__ y) {
+    float amax = 0.0f; // absolute max
+
+    for (int j = 0; j < QK2_0; ++j) {
+        amax = fmaxf(amax, fabsf(x[j]));
+    }
+
+    const float d  = amax;
+    const float id = d > 0.0f ? 1.0f/d : 0.0f;
+
+    y->d = d;
+
+    // code q in {0,1,2,3} maps to (q - 1)*d
+    for (int j = 0; j < QK2_0/4; ++j) {
+        uint8_t qb = 0;
+        for (int l = 0; l < 4; ++l) {
+            int q = (int)roundf(x[4*j + l]*id) + 1;
+            q = q < 0 ? 0 : (q > 3 ? 3 : q);
+            qb |= (uint8_t)q << (2*l);
+        }
+        y->qs[j] = qb;
+    }
+}
+
+static __device__ void quantize_f32_q2_1_block(const float * __restrict__ x, block_q2_1 * __restrict__ y) {
+    // scale from the RMS of the block; the codebook {-10, -3, +3, +10} scaled by
+    // d = 0.1510*rms puts the levels at the Lloyd-Max optimum for Gaussian data
+    // note: fmaf is used so that the CPU and CUDA implementations compute bit-identical scales
+    float sumsq = 0.0f;
+
+    for (int j = 0; j < QK2_1; ++j) {
+        sumsq = fmaf(x[j], x[j], sumsq);
+    }
+
+    const float rms = sqrtf(sumsq / QK2_1);
+    const float d   = 0.1510f * rms;
+    const float id  = d > 0.0f ? 1.0f/d : 0.0f;
+
+    y->d = d;
+
+    // branchless encoding against the decision thresholds -6.5, 0, +6.5
+    for (int j = 0; j < QK2_1/4; ++j) {
+        uint8_t qb = 0;
+        for (int l = 0; l < 4; ++l) {
+            const float xn = x[4*j + l]*id;
+            const int q = (xn > -6.5f) + (xn > 0.0f) + (xn > 6.5f);
+            qb |= (uint8_t)q << (2*l);
+        }
+        y->qs[j] = qb;
+    }
+}
+
 static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, block_iq4_nl * __restrict__ y) {
     float amax = 0.0f;
     float vmax = 0.0f;

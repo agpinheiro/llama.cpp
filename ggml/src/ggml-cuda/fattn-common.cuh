@@ -146,6 +146,75 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_bf16(
 }
 
 template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q2_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_q2_0 * K_q2_0 = (const block_q2_0 *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        const int ib  = k_KQ / (QK2_0/4);
+        const int iqs = k_KQ % (QK2_0/4);
+
+        // expand 4 x 2-bit codes into 4 signed bytes, code q maps to q - 1 in {-1, 0, +1, +2}
+        const int b = K_q2_0[ib].qs[iqs];
+        const int v = __vsubss4((b | (b << 6) | (b << 12) | (b << 18)) & 0x03030303, 0x01010101);
+
+        const int u = Q_q8[k_KQ_0/nthreads];
+
+        const int sumi = ggml_cuda_dp4a(v, u, 0);
+
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+        sum += __half2float(K_q2_0[ib].d) * sumi * Q_ds.x;
+    }
+
+    return sum;
+}
+
+// expand 4 packed 2-bit q2_1 codes (in the low byte of b) into 4 signed int8 levels
+// codes {0,1,2,3} map to the codebook {-10,-3,+3,+10}: level = 7*c - (c>>1) - 10
+static __device__ __forceinline__ int expand_q2_1_codes(const int b) {
+    const int cb = (b | (b << 6) | (b << 12) | (b << 18)) & 0x03030303; // code j in byte j
+    const int t  = 7*cb - ((cb >> 1) & 0x01010101);                     // {0, 7, 13, 20} per byte
+    return __vsubss4(t, 0x0A0A0A0A);                                    // {-10, -3, +3, +10} per byte
+}
+
+template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q2_1(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_q2_1 * K_q2_1 = (const block_q2_1 *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        const int ib  = k_KQ / (QK2_1/4);
+        const int iqs = k_KQ % (QK2_1/4);
+
+        // expand 4 x 2-bit codes into 4 signed bytes with the codebook {-10, -3, +3, +10}
+        const int v = expand_q2_1_codes(K_q2_1[ib].qs[iqs]);
+
+        const int u = Q_q8[k_KQ_0/nthreads];
+
+        const int sumi = ggml_cuda_dp4a(v, u, 0);
+
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+        sum += __half2float(K_q2_1[ib].d) * sumi * Q_ds.x;
+    }
+
+    return sum;
+}
+
+template<int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_0(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
 
@@ -406,6 +475,76 @@ static __device__ __forceinline__ void dequantize_V_bf16(const void * __restrict
 }
 
 template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_q2_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_q2_0 * x = (const block_q2_0 *) vx;
+
+    const int64_t ib  = i0 / QK2_0;
+    const int     iqs = i0 % QK2_0;
+
+    static_assert(ne == 2 || ne == 4, "bad ne");
+    const int b = x[ib].qs[iqs/4] >> (2*(iqs % 4));
+    const int q = __vsubss4((b | (b << 6) | (b << 12) | (b << 18)) & 0x03030303, 0x01010101);
+
+    const int8_t * q8 = (const int8_t *) &q;
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+        const half2 d = __half2half2(x[ib].d);
+
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            ((half2 *) dst)[l0/2] = d * make_half2(q8[l0 + 0], q8[l0 + 1]);
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+        const float d = x[ib].d;
+
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = d * q8[l];
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "bad type");
+    }
+}
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_q2_1(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_q2_1 * x = (const block_q2_1 *) vx;
+
+    const int64_t ib  = i0 / QK2_1;
+    const int     iqs = i0 % QK2_1;
+
+    static_assert(ne == 2 || ne == 4, "bad ne");
+    const int b = x[ib].qs[iqs/4] >> (2*(iqs % 4));
+    const int q = expand_q2_1_codes(b);
+
+    const int8_t * q8 = (const int8_t *) &q;
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+        const half2 d = __half2half2(x[ib].d);
+
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            ((half2 *) dst)[l0/2] = d * make_half2(q8[l0 + 0], q8[l0 + 1]);
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+        const float d = x[ib].d;
+
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = d * q8[l];
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "bad type");
+    }
+}
+
+template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_q4_0 * x = (const block_q4_0 *) vx;
 
@@ -621,6 +760,10 @@ template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
         return vec_dot_fattn_vec_KQ_f16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_Q2_0) {
+        return vec_dot_fattn_vec_KQ_q2_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_Q2_1) {
+        return vec_dot_fattn_vec_KQ_q2_1<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q4_0) {
         return vec_dot_fattn_vec_KQ_q4_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q4_1) {
@@ -643,6 +786,10 @@ template <ggml_type type_V, typename T, int ne>
 constexpr __device__ dequantize_V_t get_dequantize_V() {
     if constexpr (type_V == GGML_TYPE_F16) {
         return dequantize_V_f16<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_Q2_0) {
+        return dequantize_V_q2_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_Q2_1) {
+        return dequantize_V_q2_1<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_Q4_0) {
         return dequantize_V_q4_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_Q4_1) {
